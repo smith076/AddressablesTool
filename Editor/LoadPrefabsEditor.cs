@@ -22,6 +22,7 @@ public class LoadPrefabsEditor : Editor
     private static void EditorSceneManager_sceneSaving(UnityEngine.SceneManagement.Scene scene, string path)
     {
         instance.UpdateTransformData();
+        instance.SaveData();
     }
 
     private LoadPrefabs script;

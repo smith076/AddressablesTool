@@ -1,9 +1,11 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.Serialization.Formatters.Binary;
 using UnityEngine;
 using UnityEngine.AddressableAssets;
+using UnityEngine.Networking;
 using UnityEngine.ResourceManagement.AsyncOperations;
 
 [Serializable]
@@ -36,20 +38,19 @@ public class LoadPrefabs : MonoBehaviour
     [SerializeField] private List<AssetData> instantiatedAssets = new List<AssetData>();
 
     private Dictionary<string, GameObject> loadedInstances = new Dictionary<string, GameObject>();
-    //private string savedDataPath => Application.persistentDataPath + "/sceneData_" + gameObject.scene.name + ".abhi";
-    private string savedDataPath => Application.dataPath + "/sceneData_" + gameObject.scene.name + ".abhi";
-
+    private string savedDataPath => Application.streamingAssetsPath + "/sceneData_" + gameObject.scene.name + ".abhi";
+    
     private void Start()
     {
-        LoadAssetsFromFile();
+        LoadData();
     }
-    public void LoadAssets()
+
+    public void LoadData()
     {
-#if UNITY_EDITOR
-        // Editor loading handled by editor script
-#else
-        // Runtime loading
+#if UNITY_STANDALONE_WIN
         LoadAssetsFromFile();
+#elif UNITY_ANDROID
+        StartCoroutine(LoadFile());
 #endif
     }
 
@@ -87,6 +88,61 @@ public class LoadPrefabs : MonoBehaviour
         else
         {
             Debug.LogWarning($"No saved data file found at {savedDataPath}");
+        }
+    }
+    private IEnumerator LoadFile()
+    {
+        string path = Path.Combine(Application.streamingAssetsPath, "sceneData_BlazingHighlands.abhi");
+
+        if (Application.platform == RuntimePlatform.Android)
+        {
+            using (UnityWebRequest request = UnityWebRequest.Get(path))
+            {
+                yield return request.SendWebRequest();
+
+                if (request.result != UnityWebRequest.Result.Success)
+                {
+                    Debug.LogError($"Error reading file: {request.error}");
+                    yield break;
+                }
+
+                byte[] fileData = request.downloadHandler.data;
+                ProcessFileData(fileData);
+            }
+        }
+        else
+        {
+            if (File.Exists(path))
+            {
+                byte[] fileData = File.ReadAllBytes(path);
+                ProcessFileData(fileData);
+            }
+            else
+            {
+                Debug.LogWarning($"File not found at {path}");
+            }
+        }
+    }
+    private void ProcessFileData(byte[] fileData)
+    {
+        try
+        {
+            using (MemoryStream memoryStream = new MemoryStream(fileData))
+            {
+                BinaryFormatter formatter = new BinaryFormatter();
+                instantiatedAssets = (List<AssetData>)formatter.Deserialize(memoryStream);
+
+                Debug.Log($"Loaded {instantiatedAssets.Count} assets from file");
+
+                foreach (AssetData data in instantiatedAssets)
+                {
+                    InstantiateAsset(data);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Error processing file data: {e.Message}");
         }
     }
 
