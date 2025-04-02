@@ -5,20 +5,45 @@ using System.Collections.Generic;
 using UnityEngine.AddressableAssets;
 using System;
 using System.Linq;
-using UnityEditor.AddressableAssets.Settings;
 using UnityEditor.AddressableAssets;
+using UnityEditor.AddressableAssets.Settings;
+using UnityEditor.SceneManagement;
 
 [CustomEditor(typeof(LoadPrefabs))]
 public class LoadPrefabsEditor : Editor
 {
+    public static LoadPrefabsEditor instance;
+
+    static LoadPrefabsEditor()
+    {
+        EditorSceneManager.sceneSaving += EditorSceneManager_sceneSaving;
+    }
+
+    private static void EditorSceneManager_sceneSaving(UnityEngine.SceneManagement.Scene scene, string path)
+    {
+        instance.UpdateTransformData();
+    }
+
     private LoadPrefabs script;
-    private Dictionary<string, GameObject> editorInstances = new Dictionary<string, GameObject>();
+    // Static dictionary to maintain object references between editor sessions
+    private static Dictionary<string, GameObject> editorInstances = new Dictionary<string, GameObject>();
     private bool showAvailableAssets = true;
     private bool showInstantiatedAssets = true;
 
     private void OnEnable()
     {
         script = (LoadPrefabs)target;
+        // Clean up missing instances from the dictionary
+        List<string> keysToRemove = new List<string>();
+        foreach (var kvp in editorInstances)
+        {
+            if (kvp.Value == null)
+                keysToRemove.Add(kvp.Key);
+        }
+
+        foreach (var key in keysToRemove)
+            editorInstances.Remove(key);
+        instance = this;
     }
 
     public override void OnInspectorGUI()
@@ -48,8 +73,6 @@ public class LoadPrefabsEditor : Editor
             EditorGUILayout.PropertyField(instantiatedAssetsProp, true);
             EditorGUI.indentLevel--;
         }
-
-       
 
         EditorGUILayout.Space(10);
 
@@ -95,38 +118,58 @@ public class LoadPrefabsEditor : Editor
     private void ScanSceneForAddressables()
     {
         Debug.Log("Starting scan for addressable prefabs...");
+
+        // Get all GameObjects in the scene
         GameObject[] allObjects = FindObjectsOfType<GameObject>();
         Debug.Log($"Found {allObjects.Length} total objects in scene");
 
+        // Track which objects we've already processed to avoid duplicates
+        HashSet<GameObject> processedObjects = new HashSet<GameObject>();
         List<AssetData> newInstantiatedAssets = new List<AssetData>();
         int addressableCount = 0;
 
+        // First pass: identify all prefab instance roots
+        List<GameObject> prefabInstanceRoots = new List<GameObject>();
         foreach (GameObject obj in allObjects)
         {
+            // Check if this is a prefab instance root
+            if (PrefabUtility.IsAnyPrefabInstanceRoot(obj))
+            {
+                prefabInstanceRoots.Add(obj);
+            }
+        }
+
+        Debug.Log($"Found {prefabInstanceRoots.Count} prefab instance roots in scene");
+
+        // Process only prefab instance roots
+        foreach (GameObject obj in prefabInstanceRoots)
+        {
+            if (processedObjects.Contains(obj))
+                continue;
+
             bool isAddressable = AddressableAssetUtility.IsAssetAddressable(obj);
             if (isAddressable)
             {
                 addressableCount++;
-                string assetGuid = AssetDatabase.AssetPathToGUID(AssetDatabase.GetAssetPath(
-                    PrefabUtility.GetCorrespondingObjectFromSource(obj) ?? obj));
+                processedObjects.Add(obj);
+
+                GameObject prefabAsset = PrefabUtility.GetCorrespondingObjectFromSource(obj) ?? obj;
+                string assetGuid = AssetDatabase.AssetPathToGUID(AssetDatabase.GetAssetPath(prefabAsset));
                 Debug.Log($"Found addressable asset: {obj.name} with GUID: {assetGuid}");
 
                 // Add to available assets if not already there
                 SerializedProperty availableAssetGuidsProp = serializedObject.FindProperty("availableAssetGuids");
                 bool found = false;
-
                 for (int i = 0; i < availableAssetGuidsProp.arraySize; i++)
                 {
                     SerializedProperty element = availableAssetGuidsProp.GetArrayElementAtIndex(i);
                     string existingGuid = element.stringValue;
-
                     if (existingGuid == assetGuid)
                     {
                         found = true;
                         break;
                     }
                 }
-
                 if (!found)
                 {
                     int index = availableAssetGuidsProp.arraySize;
@@ -135,10 +178,11 @@ public class LoadPrefabsEditor : Editor
                 }
 
                 // Create asset data
+                string uniqueID = Guid.NewGuid().ToString();
                 AssetData data = new AssetData
                 {
                     assetReferenceKey = assetGuid,
-                    uniqueID = Guid.NewGuid().ToString()
+                    uniqueID = uniqueID
                 };
 
                 // Set position values individually
@@ -161,7 +205,7 @@ public class LoadPrefabsEditor : Editor
                 data.scaleZ = scale.z;
 
                 newInstantiatedAssets.Add(data);
-                editorInstances.Add(data.uniqueID, obj);
+                editorInstances[uniqueID] = obj;
             }
         }
 
@@ -170,12 +214,10 @@ public class LoadPrefabsEditor : Editor
         // Update instantiatedAssets list
         SerializedProperty instantiatedAssetsProp = serializedObject.FindProperty("instantiatedAssets");
         instantiatedAssetsProp.ClearArray();
-
         for (int i = 0; i < newInstantiatedAssets.Count; i++)
         {
             instantiatedAssetsProp.arraySize++;
             SerializedProperty element = instantiatedAssetsProp.GetArrayElementAtIndex(i);
-
             element.FindPropertyRelative("assetReferenceKey").stringValue = newInstantiatedAssets[i].assetReferenceKey;
             element.FindPropertyRelative("uniqueID").stringValue = newInstantiatedAssets[i].uniqueID;
 
@@ -201,9 +243,10 @@ public class LoadPrefabsEditor : Editor
     }
     private void InstantiateFromData()
     {
-        ClearAllInstances();
         SerializedProperty instantiatedAssetsProp = serializedObject.FindProperty("instantiatedAssets");
-        SerializedProperty availableAssetGuidsProp = serializedObject.FindProperty("availableAssetGuids");
+
+        // Keep track of which IDs were found in the data
+        HashSet<string> foundIDs = new HashSet<string>();
 
         for (int i = 0; i < instantiatedAssetsProp.arraySize; i++)
         {
@@ -211,40 +254,86 @@ public class LoadPrefabsEditor : Editor
             string assetKey = element.FindPropertyRelative("assetReferenceKey").stringValue;
             string uniqueID = element.FindPropertyRelative("uniqueID").stringValue;
 
-            // Get position components
-            float posX = element.FindPropertyRelative("posX").floatValue;
-            float posY = element.FindPropertyRelative("posY").floatValue;
-            float posZ = element.FindPropertyRelative("posZ").floatValue;
-            Vector3 position = new Vector3(posX, posY, posZ);
+            foundIDs.Add(uniqueID);
 
-            // Get rotation components
-            float rotX = element.FindPropertyRelative("rotX").floatValue;
-            float rotY = element.FindPropertyRelative("rotY").floatValue;
-            float rotZ = element.FindPropertyRelative("rotZ").floatValue;
-            float rotW = element.FindPropertyRelative("rotW").floatValue;
-            Quaternion rotation = new Quaternion(rotX, rotY, rotZ, rotW);
-
-            // Get scale components
-            float scaleX = element.FindPropertyRelative("scaleX").floatValue;
-            float scaleY = element.FindPropertyRelative("scaleY").floatValue;
-            float scaleZ = element.FindPropertyRelative("scaleZ").floatValue;
-            Vector3 scale = new Vector3(scaleX, scaleY, scaleZ);
-
-            string assetPath = AssetDatabase.GUIDToAssetPath(assetKey);
-            if (!string.IsNullOrEmpty(assetPath))
+            // Check if we already have this instance
+            if (editorInstances.ContainsKey(uniqueID) && editorInstances[uniqueID] != null)
             {
-                GameObject prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+                // We already have this instance - just update its transform
+                GameObject instance = editorInstances[uniqueID];
 
-                if (prefab != null)
+                // Get transform data
+                float posX = element.FindPropertyRelative("posX").floatValue;
+                float posY = element.FindPropertyRelative("posY").floatValue;
+                float posZ = element.FindPropertyRelative("posZ").floatValue;
+                Vector3 position = new Vector3(posX, posY, posZ);
+
+                float rotX = element.FindPropertyRelative("rotX").floatValue;
+                float rotY = element.FindPropertyRelative("rotY").floatValue;
+                float rotZ = element.FindPropertyRelative("rotZ").floatValue;
+                float rotW = element.FindPropertyRelative("rotW").floatValue;
+                Quaternion rotation = new Quaternion(rotX, rotY, rotZ, rotW);
+
+                float scaleX = element.FindPropertyRelative("scaleX").floatValue;
+                float scaleY = element.FindPropertyRelative("scaleY").floatValue;
+                float scaleZ = element.FindPropertyRelative("scaleZ").floatValue;
+                Vector3 scale = new Vector3(scaleX, scaleY, scaleZ);
+
+                // Update the transform
+                instance.transform.position = position;
+                instance.transform.rotation = rotation;
+                instance.transform.localScale = scale;
+            }
+            else
+            {
+                // We need to create this instance
+                string assetPath = AssetDatabase.GUIDToAssetPath(assetKey);
+                if (!string.IsNullOrEmpty(assetPath))
                 {
-                    GameObject instance = PrefabUtility.InstantiatePrefab(prefab) as GameObject;
-                    instance.transform.position = position;
-                    instance.transform.rotation = rotation;
-                    instance.transform.localScale = scale;
-                    editorInstances.Add(uniqueID, instance);
+                    GameObject prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+
+                    if (prefab != null)
+                    {
+                        // Get transform data
+                        float posX = element.FindPropertyRelative("posX").floatValue;
+                        float posY = element.FindPropertyRelative("posY").floatValue;
+                        float posZ = element.FindPropertyRelative("posZ").floatValue;
+                        Vector3 position = new Vector3(posX, posY, posZ);
+
+                        float rotX = element.FindPropertyRelative("rotX").floatValue;
+                        float rotY = element.FindPropertyRelative("rotY").floatValue;
+                        float rotZ = element.FindPropertyRelative("rotZ").floatValue;
+                        float rotW = element.FindPropertyRelative("rotW").floatValue;
+                        Quaternion rotation = new Quaternion(rotX, rotY, rotZ, rotW);
+
+                        float scaleX = element.FindPropertyRelative("scaleX").floatValue;
+                        float scaleY = element.FindPropertyRelative("scaleY").floatValue;
+                        float scaleZ = element.FindPropertyRelative("scaleZ").floatValue;
+                        Vector3 scale = new Vector3(scaleX, scaleY, scaleZ);
+
+                        GameObject instance = PrefabUtility.InstantiatePrefab(prefab) as GameObject;
+                        instance.transform.position = position;
+                        instance.transform.rotation = rotation;
+                        instance.transform.localScale = scale;
+                        editorInstances[uniqueID] = instance;
+                    }
                 }
             }
         }
+
+        // Remove any instances that weren't in the data
+        List<string> keysToRemove = new List<string>();
+        foreach (var kvp in editorInstances)
+        {
+            if (!foundIDs.Contains(kvp.Key) && kvp.Value != null)
+            {
+                DestroyImmediate(kvp.Value);
+                keysToRemove.Add(kvp.Key);
+            }
+        }
+
+        foreach (var key in keysToRemove)
+            editorInstances.Remove(key);
     }
 
     private void UpdateTransformData()
@@ -256,28 +345,28 @@ public class LoadPrefabsEditor : Editor
             SerializedProperty element = instantiatedAssetsProp.GetArrayElementAtIndex(i);
             string uniqueID = element.FindPropertyRelative("uniqueID").stringValue;
 
-            if (editorInstances.ContainsKey(uniqueID))
+            if (editorInstances.ContainsKey(uniqueID) && editorInstances[uniqueID] != null)
             {
                 GameObject instance = editorInstances[uniqueID];
 
-                if (instance != null)
-                {
-                    Vector3 pos = instance.transform.position;
-                    element.FindPropertyRelative("posX").floatValue = pos.x;
-                    element.FindPropertyRelative("posY").floatValue = pos.y;
-                    element.FindPropertyRelative("posZ").floatValue = pos.z;
+                // Update position
+                Vector3 pos = instance.transform.position;
+                element.FindPropertyRelative("posX").floatValue = pos.x;
+                element.FindPropertyRelative("posY").floatValue = pos.y;
+                element.FindPropertyRelative("posZ").floatValue = pos.z;
 
-                    Quaternion rot = instance.transform.rotation;
-                    element.FindPropertyRelative("rotX").floatValue = rot.x;
-                    element.FindPropertyRelative("rotY").floatValue = rot.y;
-                    element.FindPropertyRelative("rotZ").floatValue = rot.z;
-                    element.FindPropertyRelative("rotW").floatValue = rot.w;
+                // Update rotation
+                Quaternion rot = instance.transform.rotation;
+                element.FindPropertyRelative("rotX").floatValue = rot.x;
+                element.FindPropertyRelative("rotY").floatValue = rot.y;
+                element.FindPropertyRelative("rotZ").floatValue = rot.z;
+                element.FindPropertyRelative("rotW").floatValue = rot.w;
 
-                    Vector3 scale = instance.transform.localScale;
-                    element.FindPropertyRelative("scaleX").floatValue = scale.x;
-                    element.FindPropertyRelative("scaleY").floatValue = scale.y;
-                    element.FindPropertyRelative("scaleZ").floatValue = scale.z;
-                }
+                // Update scale
+                Vector3 scale = instance.transform.localScale;
+                element.FindPropertyRelative("scaleX").floatValue = scale.x;
+                element.FindPropertyRelative("scaleY").floatValue = scale.y;
+                element.FindPropertyRelative("scaleZ").floatValue = scale.z;
             }
         }
 
@@ -292,22 +381,43 @@ public class LoadPrefabsEditor : Editor
 
     private void ClearAllInstances()
     {
-        foreach (var instance in editorInstances.Values)
+        // Only destroy the game objects, but keep the references in the dictionary
+        foreach (var kvp in editorInstances)
         {
-            if (instance != null)
+            if (kvp.Value != null)
+                DestroyImmediate(kvp.Value);
+        }
+    }
+
+    // Draw gizmos to visualize the addressable instances
+    [DrawGizmo(GizmoType.Selected | GizmoType.NonSelected)]
+    private static void DrawGizmos(LoadPrefabs loadPrefabs, GizmoType gizmoType)
+    {
+        if (!EditorApplication.isPlaying)
+        {
+            // Draw indicators for uninstantiated entries
+            var instantiatedAssetsProp = new SerializedObject(loadPrefabs).FindProperty("instantiatedAssets");
+            if (instantiatedAssetsProp != null)
             {
-                DestroyImmediate(instance);
+                for (int i = 0; i < instantiatedAssetsProp.arraySize; i++)
+                {
+                    var element = instantiatedAssetsProp.GetArrayElementAtIndex(i);
+                    string uniqueID = element.FindPropertyRelative("uniqueID").stringValue;
+
+                    if (!editorInstances.ContainsKey(uniqueID) || editorInstances[uniqueID] == null)
+                    {
+                        // Draw a wireframe cube to indicate a missing instance
+                        float posX = element.FindPropertyRelative("posX").floatValue;
+                        float posY = element.FindPropertyRelative("posY").floatValue;
+                        float posZ = element.FindPropertyRelative("posZ").floatValue;
+                        Vector3 position = new Vector3(posX, posY, posZ);
+
+                        Gizmos.color = Color.yellow;
+                        Gizmos.DrawWireCube(position, Vector3.one * 0.3f);
+                    }
+                }
             }
         }
-        foreach(var instance in script.loadedInstances)
-        {
-            if(instance.Value != null)
-            {
-                DestroyImmediate(script.loadedInstances[instance.Key]);
-            }
-        }
-        script.loadedInstances.Clear();
-        editorInstances.Clear();
     }
 }
 
